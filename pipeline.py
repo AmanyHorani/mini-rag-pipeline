@@ -2,12 +2,34 @@ import os
 import re
 import json
 import hashlib
-from datetime import datetime
 from pathlib import Path
-from collections import defaultdict
+from datetime import datetime
+
+from dotenv import load_dotenv
+
+from google import genai
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+
+# =========================================================
+# LOAD ENVIRONMENT VARIABLES
+# =========================================================
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("Missing GEMINI_API_KEY in .env")
+
+
+# =========================================================
+# GEMINI CLIENT
+# =========================================================
+
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # =========================================================
@@ -25,6 +47,7 @@ ALLOWED_RETRIEVAL_STATUSES = {
     "partial_hit",
     "miss"
 }
+
 
 # =========================================================
 # PIPELINE STAGES
@@ -44,6 +67,7 @@ PIPELINE_STAGES = [
 
 current_stage = "INIT"
 
+
 # =========================================================
 # PATHS
 # =========================================================
@@ -53,27 +77,61 @@ ARTIFACTS_DIR = "artifacts"
 
 Path(ARTIFACTS_DIR).mkdir(exist_ok=True)
 
+
 # =========================================================
-# DOCUMENT INGESTION
+# LLM CALL LOGGER
+# =========================================================
+
+def log_llm_call(
+    stage,
+    query_id,
+    prompt,
+    input_artifacts,
+    output_artifact
+):
+
+    record = {
+        "stage": stage,
+        "query_id": query_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "provider": "google",
+        "model": "gemini-2.5-flash",
+        "prompt_hash": hashlib.sha256(
+            prompt.encode()
+        ).hexdigest(),
+        "input_artifacts": input_artifacts,
+        "output_artifact": output_artifact
+    }
+
+    with open("llm_calls.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+# =========================================================
+# DOCUMENT LOADING
 # =========================================================
 
 def load_documents():
+
     global current_stage
 
     documents = []
 
-    for file_name in os.listdir(KB_DIR):
+    for filename in os.listdir(KB_DIR):
 
-        file_path = os.path.join(KB_DIR, file_name)
-
-        if not file_name.endswith(".txt"):
+        if not filename.endswith(".txt"):
             continue
 
-        with open(file_path, "r", encoding="utf-8") as f:
+        path = os.path.join(KB_DIR, filename)
+
+        with open(path, "r", encoding="utf-8") as f:
             content = f.read()
 
         title_match = re.search(r"Title:\s*(.*)", content)
         section_match = re.search(r"Section:\s*(.*)", content)
+
+        if not title_match or not section_match:
+            continue
 
         title = title_match.group(1).strip()
         section = section_match.group(1).strip()
@@ -90,11 +148,15 @@ def load_documents():
 
     return documents
 
+
 # =========================================================
 # CHUNKING
 # =========================================================
 
-def chunk_documents(documents, chunk_size=220):
+def chunk_documents(
+    documents,
+    chunk_size=250
+):
 
     global current_stage
 
@@ -129,12 +191,17 @@ def chunk_documents(documents, chunk_size=220):
 
             start = end
 
-    with open(f"{ARTIFACTS_DIR}/chunks.json", "w", encoding="utf-8") as f:
+    with open(
+        f"{ARTIFACTS_DIR}/chunks.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
         json.dump(chunks, f, indent=2)
 
     current_stage = "DOCUMENTS_CHUNKED"
 
     return chunks
+
 
 # =========================================================
 # INDEX BUILDING
@@ -146,7 +213,9 @@ def build_index(chunks):
 
     texts = [chunk["text"] for chunk in chunks]
 
-    vectorizer = TfidfVectorizer(stop_words="english")
+    vectorizer = TfidfVectorizer(
+        stop_words="english"
+    )
 
     vectors = vectorizer.fit_transform(texts)
 
@@ -154,17 +223,22 @@ def build_index(chunks):
 
     return vectorizer, vectors
 
+
 # =========================================================
 # RETRIEVAL
 # =========================================================
 
-def retrieve(queries, chunks, vectorizer, vectors, top_k=3):
+def retrieve(
+    queries,
+    chunks,
+    vectorizer,
+    vectors,
+    top_k=3
+):
 
     global current_stage
 
     retrieval_results = []
-
-    chunk_texts = [chunk["text"] for chunk in chunks]
 
     for query in queries:
 
@@ -172,13 +246,19 @@ def retrieve(queries, chunks, vectorizer, vectors, top_k=3):
 
         query_vector = vectorizer.transform([question])
 
-        similarities = cosine_similarity(query_vector, vectors).flatten()
+        similarities = cosine_similarity(
+            query_vector,
+            vectors
+        ).flatten()
 
         ranked_indices = similarities.argsort()[::-1]
 
         top_chunks = []
 
-        for rank, idx in enumerate(ranked_indices[:top_k], start=1):
+        for rank, idx in enumerate(
+            ranked_indices[:top_k],
+            start=1
+        ):
 
             chunk = chunks[idx]
 
@@ -196,36 +276,93 @@ def retrieve(queries, chunks, vectorizer, vectors, top_k=3):
             "top_k": top_chunks
         })
 
-    with open(f"{ARTIFACTS_DIR}/retrieval.json", "w", encoding="utf-8") as f:
+    with open(
+        f"{ARTIFACTS_DIR}/retrieval.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
         json.dump(retrieval_results, f, indent=2)
 
     current_stage = "RETRIEVAL_COMPLETE"
 
     return retrieval_results
 
+
 # =========================================================
-# ANSWER GENERATION
+# ANSWER GENERATION WITH GEMINI
 # =========================================================
 
 def generate_answers(retrieval_results):
 
     global current_stage
 
+    if current_stage != "RETRIEVAL_COMPLETE":
+        raise Exception(
+            "Answers cannot be generated before retrieval."
+        )
+
     answers = []
 
     for result in retrieval_results:
 
-        best_chunk = result["top_k"][0]
+        query_id = result["query_id"]
 
-        citation = f"[{best_chunk['doc_title']} §{best_chunk['chunk_id']}]"
+        question = result["question"]
 
-        score = best_chunk["score"]
+        retrieved_chunks = result["top_k"]
 
-        if score < 0.05:
+        context = "\n\n".join([
+            (
+                f"Chunk ID: {chunk['chunk_id']}\n"
+                f"Document: {chunk['doc_title']}\n"
+                f"Text: {chunk['chunk_text']}"
+            )
+            for chunk in retrieved_chunks
+        ])
+
+        prompt = f"""
+You are a citation-strict RAG assistant.
+
+Answer ONLY using the retrieved context.
+
+If the answer is not supported by context,
+respond with:
+INSUFFICIENT_CONTEXT
+
+Rules:
+- Do not invent facts
+- Use only retrieved chunks
+- Every factual statement must cite chunks
+- Citation format:
+[doc_title §chunk_id]
+
+QUESTION:
+{question}
+
+RETRIEVED CONTEXT:
+{context}
+"""
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        generated_text = response.text.strip()
+
+        log_llm_call(
+            stage="ANSWERS_GENERATED",
+            query_id=query_id,
+            prompt=prompt,
+            input_artifacts=[
+                "artifacts/retrieval.json"
+            ],
+            output_artifact="artifacts/answers.json"
+        )
+
+        if "INSUFFICIENT_CONTEXT" in generated_text:
 
             answer_label = "insufficient_context"
-
-            answer = "Insufficient context to answer the question."
 
             citations = []
 
@@ -235,32 +372,53 @@ def generate_answers(retrieval_results):
 
             answer_label = "grounded_answer"
 
-            answer = f"{best_chunk['chunk_text']} {citation}"
+            citations = re.findall(
+                r"\[(.*?)\]",
+                generated_text
+            )
 
-            citations = [citation]
+            used_chunk_ids = []
 
-            used_chunk_ids = [best_chunk["chunk_id"]]
+            for citation in citations:
+
+                match = re.search(
+                    r"§(chunk_\d+)",
+                    citation
+                )
+
+                if match:
+                    used_chunk_ids.append(
+                        match.group(1)
+                    )
 
         answers.append({
-            "query_id": result["query_id"],
+            "query_id": query_id,
             "answer_label": answer_label,
-            "answer": answer,
+            "answer": generated_text,
             "citations": citations,
             "used_chunk_ids": used_chunk_ids
         })
 
-    with open(f"{ARTIFACTS_DIR}/answers.json", "w", encoding="utf-8") as f:
+    with open(
+        f"{ARTIFACTS_DIR}/answers.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
         json.dump(answers, f, indent=2)
 
     current_stage = "ANSWERS_GENERATED"
 
     return answers
 
+
 # =========================================================
 # EVALUATION
 # =========================================================
 
-def evaluate(queries, retrieval_results):
+def evaluate(
+    queries,
+    retrieval_results
+):
 
     global current_stage
 
@@ -270,9 +428,14 @@ def evaluate(queries, retrieval_results):
     partial_hits = 0
     misses = 0
 
-    for query, retrieval in zip(queries, retrieval_results):
+    for query, retrieval in zip(
+        queries,
+        retrieval_results
+    ):
 
-        expected_titles = query["expected_doc_titles"]
+        expected_titles = query[
+            "expected_doc_titles"
+        ]
 
         retrieved_titles = [
             item["doc_title"]
@@ -288,7 +451,9 @@ def evaluate(queries, retrieval_results):
 
             retrieval_status = "hit"
 
-            explanation = "Expected title found in top 3"
+            explanation = (
+                "Expected title found in top 3"
+            )
 
             hits += 1
 
@@ -296,7 +461,9 @@ def evaluate(queries, retrieval_results):
 
             retrieval_status = "miss"
 
-            explanation = "Expected title not found"
+            explanation = (
+                "Expected title not found"
+            )
 
             misses += 1
 
@@ -310,7 +477,9 @@ def evaluate(queries, retrieval_results):
         })
 
     summary = {
-        "top3_hit_rate": hits / len(queries),
+        "top3_hit_rate": (
+            hits / len(queries)
+        ),
         "total_queries": len(queries),
         "hits": hits,
         "partial_hits": partial_hits,
@@ -322,28 +491,38 @@ def evaluate(queries, retrieval_results):
         "summary": summary
     }
 
-    with open(f"{ARTIFACTS_DIR}/eval.json", "w", encoding="utf-8") as f:
+    with open(
+        f"{ARTIFACTS_DIR}/eval.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
         json.dump(eval_output, f, indent=2)
 
     current_stage = "EVALUATION_COMPLETE"
 
     return eval_output
 
+
 # =========================================================
 # GROUNDING CHECK
 # =========================================================
 
-def grounding_check(answers, retrieval_results):
+def grounding_check(
+    answers,
+    retrieval_results
+):
 
     checks = []
 
-    retrieval_map = {}
+    retrieval_chunk_ids = set()
 
     for retrieval in retrieval_results:
 
         for chunk in retrieval["top_k"]:
 
-            retrieval_map[chunk["chunk_id"]] = chunk["chunk_text"]
+            retrieval_chunk_ids.add(
+                chunk["chunk_id"]
+            )
 
     for answer in answers:
 
@@ -351,13 +530,17 @@ def grounding_check(answers, retrieval_results):
 
         explanation = "All citations valid"
 
-        for chunk_id in answer["used_chunk_ids"]:
+        for chunk_id in answer[
+            "used_chunk_ids"
+        ]:
 
-            if chunk_id not in retrieval_map:
+            if chunk_id not in retrieval_chunk_ids:
 
                 valid = False
 
-                explanation = "Citation refers to non-retrieved chunk"
+                explanation = (
+                    "Citation refers to non-retrieved chunk"
+                )
 
         checks.append({
             "query_id": answer["query_id"],
@@ -365,34 +548,13 @@ def grounding_check(answers, retrieval_results):
             "explanation": explanation
         })
 
-    with open(f"{ARTIFACTS_DIR}/grounding_check.json", "w", encoding="utf-8") as f:
+    with open(
+        f"{ARTIFACTS_DIR}/grounding_check.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
         json.dump(checks, f, indent=2)
 
-# =========================================================
-# CHUNKING COMPARISON
-# =========================================================
-
-def chunking_comparison():
-
-    comparison = {
-        "strategies": [
-            {
-                "name": "fixed_size",
-                "description": "Deterministic character-based chunking"
-            },
-            {
-                "name": "paragraph_based",
-                "description": "Better semantic preservation but variable chunk sizes"
-            }
-        ],
-        "tradeoff": (
-            "Fixed-size chunking is simpler and deterministic, "
-            "while paragraph chunking preserves semantic coherence better."
-        )
-    }
-
-    with open(f"{ARTIFACTS_DIR}/chunking_comparison.json", "w", encoding="utf-8") as f:
-        json.dump(comparison, f, indent=2)
 
 # =========================================================
 # MAIN
@@ -408,7 +570,11 @@ def main():
 
     vectorizer, vectors = build_index(chunks)
 
-    with open("queries.json", "r", encoding="utf-8") as f:
+    with open(
+        "queries.json",
+        "r",
+        encoding="utf-8"
+    ) as f:
         queries = json.load(f)
 
     retrieval_results = retrieve(
@@ -418,19 +584,26 @@ def main():
         vectors
     )
 
-    answers = generate_answers(retrieval_results)
+    answers = generate_answers(
+        retrieval_results
+    )
 
-    evaluate(queries, retrieval_results)
+    evaluate(
+        queries,
+        retrieval_results
+    )
 
-    grounding_check(answers, retrieval_results)
-
-    chunking_comparison()
+    grounding_check(
+        answers,
+        retrieval_results
+    )
 
     global current_stage
 
     current_stage = "RESULTS_FINALISED"
 
     print("Pipeline completed successfully!")
+
 
 if __name__ == "__main__":
     main()

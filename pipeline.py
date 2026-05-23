@@ -95,7 +95,7 @@ def log_llm_call(
         "query_id": query_id,
         "timestamp": datetime.utcnow().isoformat(),
         "provider": "google",
-        "model": "gemini-2.0-flash",
+        "model": "gemini-2.5-flash",
         "prompt_hash": hashlib.sha256(
             prompt.encode()
         ).hexdigest(),
@@ -344,7 +344,7 @@ RETRIEVED CONTEXT:
 """
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=prompt
         )
 
